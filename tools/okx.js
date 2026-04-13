@@ -273,19 +273,169 @@ export async function fetchOkxDexSignal(mint) {
   }
 }
 
+function sma(values, period) {
+  if (values.length < period) return null;
+  const slice = values.slice(-period);
+  return slice.reduce((sum, value) => sum + value, 0) / period;
+}
+
+function stddev(values, period) {
+  if (values.length < period) return null;
+  const slice = values.slice(-period);
+  const mean = slice.reduce((sum, value) => sum + value, 0) / period;
+  const variance = slice.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0) / period;
+  return Math.sqrt(variance);
+}
+
+function emaSeries(values, period) {
+  if (values.length < period) return [];
+  const alpha = 2 / (period + 1);
+  const result = [];
+  let ema = values.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+  result[period - 1] = ema;
+  for (let i = period; i < values.length; i++) {
+    ema = (values[i] - ema) * alpha + ema;
+    result[i] = ema;
+  }
+  return result;
+}
+
+function rsi(values, period = 2) {
+  if (values.length <= period) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = values.length - period; i < values.length; i++) {
+    const change = values[i] - values[i - 1];
+    if (change >= 0) gains += change;
+    else losses += Math.abs(change);
+  }
+  if (losses === 0) return gains === 0 ? 50 : 100;
+  const rs = gains / losses;
+  return 100 - (100 / (1 + rs));
+}
+
+function macd(closes, fast = 12, slow = 26, signal = 9) {
+  if (closes.length < slow + signal) return null;
+  const fastEma = emaSeries(closes, fast);
+  const slowEma = emaSeries(closes, slow);
+  const macdLine = closes.map((_, i) =>
+    fastEma[i] != null && slowEma[i] != null ? fastEma[i] - slowEma[i] : null
+  );
+  const compact = macdLine.filter((value) => value != null);
+  if (compact.length < signal) return null;
+  const signalCompact = emaSeries(compact, signal);
+  const hist = compact.map((value, i) =>
+    signalCompact[i] != null ? value - signalCompact[i] : null
+  ).filter((value) => value != null);
+  const latestHist = hist.at(-1);
+  const prevHist = hist.at(-2);
+  return {
+    line: roundTo(compact.at(-1), 10),
+    signal: roundTo(signalCompact.filter((value) => value != null).at(-1), 10),
+    histogram: roundTo(latestHist, 10),
+    first_green_histogram: prevHist != null && prevHist <= 0 && latestHist > 0,
+  };
+}
+
+function averageTrueRange(candles, period = 10) {
+  if (candles.length <= period) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const prevClose = candles[i - 1].close;
+    trs.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - prevClose),
+      Math.abs(candles[i].low - prevClose)
+    ));
+  }
+  return sma(trs, period);
+}
+
+function supertrend(candles, period = 10, multiplier = 3) {
+  if (candles.length <= period + 1) return null;
+  const states = [];
+
+  for (let i = period; i < candles.length; i++) {
+    const window = candles.slice(0, i + 1);
+    const atr = averageTrueRange(window, period);
+    if (atr == null) continue;
+
+    const candle = candles[i];
+    const hl2 = (candle.high + candle.low) / 2;
+    const basicUpper = hl2 + multiplier * atr;
+    const basicLower = hl2 - multiplier * atr;
+    const prev = states.at(-1);
+
+    const finalUpper = !prev || basicUpper < prev.finalUpper || candles[i - 1].close > prev.finalUpper
+      ? basicUpper
+      : prev.finalUpper;
+    const finalLower = !prev || basicLower > prev.finalLower || candles[i - 1].close < prev.finalLower
+      ? basicLower
+      : prev.finalLower;
+
+    let direction = "green";
+    let value = finalLower;
+    if (prev?.direction === "green") {
+      direction = candle.close < finalLower ? "red" : "green";
+    } else if (prev?.direction === "red") {
+      direction = candle.close > finalUpper ? "green" : "red";
+    }
+    value = direction === "green" ? finalLower : finalUpper;
+
+    states.push({
+      direction,
+      value,
+      finalUpper,
+      finalLower,
+      close: candle.close,
+    });
+  }
+
+  const latest = states.at(-1);
+  const previous = states.at(-2);
+  if (!latest) return null;
+  return {
+    direction: latest.direction,
+    value: roundTo(latest.value, 12),
+    price_above: latest.close > latest.value,
+    flipped_green: previous?.direction === "red" && latest.direction === "green",
+  };
+}
+
+function roundTo(value, decimals = 2) {
+  return Number.isFinite(value) ? Number(value.toFixed(decimals)) : null;
+}
+
 /**
- * Fetch 6x 5m candles and summarize into actionable signals.
+ * Fetch 50x 5m candles and summarize into actionable signals.
  */
 async function fetchCandleSummary(mint) {
-  const json = await fetchOkxJson(`${OKX_CANDLES_URL}?chainIndex=501&tokenContractAddress=${mint}&bar=5m&limit=6`);
+  const json = await fetchOkxJson(`${OKX_CANDLES_URL}?chainIndex=501&tokenContractAddress=${mint}&bar=5m&limit=50`);
   if (!json) return null;
   const candles = json?.data;
   if (!candles?.length) return null;
 
-  const vols = candles.map((c) => parseFloat(c[6] || 0));
-  const closes = candles.map((c) => parseFloat(c[4] || 0));
-  const highs = candles.map((c) => parseFloat(c[2] || 0));
-  const lows = candles.map((c) => parseFloat(c[3] || 0));
+  const parsed = candles
+    .map((c) => ({
+      ts: Number(c[0] || 0),
+      open: parseFloat(c[1] || 0),
+      high: parseFloat(c[2] || 0),
+      low: parseFloat(c[3] || 0),
+      close: parseFloat(c[4] || 0),
+      volume_tokens: parseFloat(c[5] || 0),
+      volume_usd: parseFloat(c[6] || 0),
+    }))
+    .filter((c) => c.ts > 0 && c.high > 0 && c.low > 0 && c.close > 0)
+    .sort((a, b) => a.ts - b.ts);
+
+  if (!parsed.length) return null;
+
+  const recent6 = parsed.slice(-6);
+  const vols = recent6.map((c) => c.volume_usd);
+  const closes = recent6.map((c) => c.close);
+  const highs = recent6.map((c) => c.high);
+  const lows = recent6.map((c) => c.low);
+  const allCloses = parsed.map((c) => c.close);
 
   const firstAvg = vols.slice(0, 3).reduce((s, v) => s + v, 0) / 3;
   const lastAvg = vols.slice(-3).reduce((s, v) => s + v, 0) / 3;
@@ -312,6 +462,17 @@ async function fetchCandleSummary(mint) {
     acceleration = "decelerating";
   }
 
+  const bbMid = sma(allCloses, 20);
+  const bbStd = stddev(allCloses, 20);
+  const bbUpper = bbMid != null && bbStd != null ? bbMid + (2 * bbStd) : null;
+  const latestClose = allCloses.at(-1);
+  const latestRsi2 = rsi(allCloses, 2);
+  const macdResult = macd(allCloses);
+  const supertrendResult = supertrend(parsed, 10, 3);
+  const closesAboveBbUpper = bbUpper != null && latestClose > bbUpper;
+  const rsi2Above90 = latestRsi2 != null && latestRsi2 > 90;
+  const macdFirstGreen = !!macdResult?.first_green_histogram;
+
   return {
     volume_trend,
     volume_dying,
@@ -319,6 +480,24 @@ async function fetchCandleSummary(mint) {
     price_range_pct,
     acceleration,
     latest_3_volumes_usd: vols.slice(-3).map((v) => Math.round(v)),
+    candle_count: parsed.length,
+    rsi_2: roundTo(latestRsi2, 2),
+    rsi_2_above_90: rsi2Above90,
+    bb_upper: roundTo(bbUpper, 12),
+    close_above_bb_upper: closesAboveBbUpper,
+    macd: macdResult,
+    macd_first_green_histogram: macdFirstGreen,
+    supertrend: supertrendResult,
+    supertrend_direction: supertrendResult?.direction || null,
+    supertrend_green: supertrendResult?.direction === "green",
+    supertrend_price_above: !!supertrendResult?.price_above,
+    evil_panda_entry_ok: supertrendResult?.direction === "green" && !!supertrendResult?.price_above,
+    evil_panda_exit_signal: rsi2Above90 && (closesAboveBbUpper || macdFirstGreen),
+    evil_panda_exit_reason: rsi2Above90 && closesAboveBbUpper
+      ? "RSI(2)>90 + close above BB upper"
+      : rsi2Above90 && macdFirstGreen
+        ? "RSI(2)>90 + MACD first green histogram"
+        : null,
   };
 }
 
@@ -361,6 +540,10 @@ export async function fetchOkxPriceInfo(mint) {
       change_24h: parseFloat(d.priceChange24H || 0),
       volume_5m: parseFloat(d.volume5M || 0),
       volume_1h: parseFloat(d.volume1H || 0),
+      volume_24h: parseFloat(d.volume24H || 0),
+      market_cap: parseFloat(d.marketCap || 0),
+      holders: parseInt(d.holders || 0, 10) || null,
+      liquidity: parseFloat(d.liquidity || 0),
       candles: candles || null,
     };
 

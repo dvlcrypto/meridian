@@ -199,6 +199,20 @@ function startCronJobs() {
             const hint = `${p.pair}: Top LPer avg hold: ${p.study_avg_hold_hours}h (from study at deploy)`;
             holdTimeHints.push(yourHours != null ? `${hint} — your age: ${yourHours}h` : hint);
           }
+
+          if (p.strategy_profile === "evil_panda" && p.base_mint) {
+            try {
+              const okx = await fetchOkxPriceInfo(p.base_mint);
+              const c = okx?.candles;
+              if (c) {
+                const pnlPositive = (p.pnl_pct ?? 0) > 0;
+                const exitOk = pnlPositive && c.evil_panda_exit_signal;
+                const line = `${p.pair}: Evil Panda exit check - pnl=${p.pnl_pct ?? "?"}% (${pnlPositive ? "positive" : "not positive"}), RSI(2)=${c.rsi_2 ?? "?"}, close>BB_upper=${!!c.close_above_bb_upper}, MACD_first_green=${!!c.macd_first_green_histogram}, exit=${exitOk ? "YES" : "NO"}${c.evil_panda_exit_reason ? ` (${c.evil_panda_exit_reason})` : ""}`;
+                if (exitOk) exits.push(line);
+                else holdTimeHints.push(line);
+              }
+            } catch { /* OKX exit context is best-effort */ }
+          }
         }
         if (recalls.length > 0) {
           memoryHints = `\n\nMEMORY RECALL (from past sessions):\n${recalls.join("\n")}\n`;
@@ -501,6 +515,14 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
           if (okxResult) {
             block += ` | ath: ${okxResult.ath_proximity_pct ?? "?"}%`;
             block += ` | momentum: 5m=${okxResult.change_5m ?? "?"}% 1h=${okxResult.change_1h ?? "?"}%`;
+            block += ` | token24hVol: $${Math.round(okxResult.volume_24h ?? 0)} | tokenMcap: $${Math.round(okxResult.market_cap ?? 0)}`;
+            if (okxResult.candles) {
+              const epPass = okxResult.volume_24h >= (config.strategy.evilPanda?.minTokenVolume24h ?? 750000)
+                && okxResult.market_cap >= (config.strategy.evilPanda?.minMcap ?? 200000)
+                && okxResult.candles.evil_panda_entry_ok;
+              block += `\n  Evil Panda entry: ${epPass ? "PASS" : "FAIL"} | need token24hVol>=${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, mcap>=${config.strategy.evilPanda?.minMcap ?? 200000}, 5m Supertrend green/price above`;
+              block += ` | supertrend=${okxResult.candles.supertrend_direction ?? "?"}/${okxResult.candles.supertrend_price_above ? "above" : "not-above"} | RSI(2)=${okxResult.candles.rsi_2 ?? "?"}`;
+            }
             if (okxResult.ath_proximity_pct != null && okxResult.ath_proximity_pct >= config.screening.athTopThresholdPct) {
               block += `\n  ATH WARNING: ${okxResult.ath_proximity_pct}% of ATH (>=${config.screening.athTopThresholdPct}%) — override bid_ask range to 65-80%`;
             }
@@ -546,6 +568,10 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
               okx_signal_present: (c._okxSignal?.signal_count_30m || 0) > 0,
               change_1h: c._okxResult?.change_1h ?? null,
               candle_price_range: c._okxResult?.candles?.price_range_pct ?? null,
+              token_volume_24h: c._okxResult?.volume_24h ?? null,
+              token_market_cap: c._okxResult?.market_cap ?? null,
+              supertrend_green: c._okxResult?.candles?.supertrend_green ?? null,
+              rsi_2: c._okxResult?.candles?.rsi_2 ?? null,
               // Extra OKX signal metadata (not weighted but stored for analysis)
               okx_signal_count_30m: c._okxSignal?.signal_count_30m ?? null,
               okx_signal_count_2h: c._okxSignal?.signal_count_2h ?? null,
@@ -588,7 +614,7 @@ ${activeStrategy ? `\nSAVED STRATEGY (reference, not mandatory): ${activeStrateg
       } catch { /* best-effort */ }
 
       const okxSignalGuide = candidateBlocks
-        ? `\n\nOKX SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher wallet interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent wallet conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use OKX signal as confirmation only, never as a standalone deploy trigger\n- Missing OKX signal is neutral, not a hard fail\n`
+        ? `\n\nOKX SIGNAL INTERPRETATION:\n- latest_signal_age_min lower = fresher wallet interest\n- signal_count_30m / signal_count_2h and signal_amount_usd_30m / signal_amount_usd_2h measure recent wallet conviction\n- latest_sold_ratio_percent lower = signal wallets are still holding; higher = signal more exhausted\n- Use OKX signal as confirmation only, never as a standalone deploy trigger\n- Missing OKX signal is neutral, not a hard fail\n- Evil Panda entry requires token-level OKX volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, OKX marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend\n`
         : "";
 
       const { content } = await screenerLoop(`

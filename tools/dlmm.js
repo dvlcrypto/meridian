@@ -23,6 +23,7 @@ import { recordPerformance } from "../lessons.js";
 import { getAndClearStagedSignals } from "../signal-tracker.js";
 import { normalizeMint, getWalletBalances, swapToken } from "./wallet.js";
 import { calculateBinsForPriceRange, splitRangeBins } from "../runtime-helpers.js";
+import { fetchOkxPriceInfo } from "./okx.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -223,7 +224,7 @@ export async function deployPosition({
   study_avg_hold_hours,
 }) {
   pool_address = normalizeMint(pool_address);
-  const activeStrategy = strategy || config.strategy.strategy;
+  let activeStrategy = strategy || config.strategy.strategy;
   let resolvedBinStep = bin_step;
   let totalSolAmount = amount_y ?? amount_sol ?? 0;
 
@@ -239,12 +240,75 @@ export async function deployPosition({
       if (totalSolAmount < computed * 0.5) {
         log("deploy", `Amount ${totalSolAmount} SOL overridden to ${computed} SOL (model passed too little, computed from ${bal.sol} SOL wallet)`);
         totalSolAmount = computed;
+        if (amount_y != null) amount_y = computed;
+        else if (amount_sol != null) amount_sol = computed;
       }
     }
   } catch { /* best-effort — use what the model passed */ }
 
   if (!["bid_ask", "spot"].includes(activeStrategy)) {
     throw new Error("Only 'bid_ask' or 'spot' strategies are allowed.");
+  }
+
+  // Evil Panda is a named policy mapped onto the executor's supported
+  // single-sided SOL spot primitive. Enforce its entry criteria here so the
+  // model cannot accidentally bypass the strategy with a weaker prompt-only check.
+  if (config.strategy.activeStrategy === "evil_panda") {
+    const ep = config.strategy.evilPanda || {};
+    activeStrategy = "spot";
+    price_range_pct = Math.max(price_range_pct || 0, ep.priceRangePct || 80);
+    bins_above = 0;
+
+    if ((amount_x ?? 0) > 0) {
+      return { success: false, error: "Evil Panda requires single-sided SOL spot: do not pass amount_x." };
+    }
+    if (sol_split_pct != null && sol_split_pct < 100) {
+      return { success: false, error: "Evil Panda requires single-sided SOL spot: omit sol_split_pct or use 100." };
+    }
+
+    let resolvedMint = base_mint;
+    if (!resolvedMint) {
+      try {
+        const pool = await getPool(pool_address);
+        resolvedMint = pool.lbPair.tokenXMint.toBase58();
+      } catch {
+        resolvedMint = null;
+      }
+    }
+    if (!resolvedMint) {
+      return { success: false, error: "Evil Panda entry blocked: base_mint is required to verify token-level OKX data." };
+    }
+
+    const okx = await fetchOkxPriceInfo(resolvedMint);
+    const tokenVolume24h = okx?.volume_24h ?? 0;
+    const tokenMcap = okx?.market_cap ?? 0;
+    const indicators = okx?.candles || null;
+    const supertrendOk = !!indicators?.evil_panda_entry_ok;
+
+    const failures = [];
+    if (tokenVolume24h < (ep.minTokenVolume24h ?? 750_000)) {
+      failures.push(`token volume24H $${Math.round(tokenVolume24h)} < $${ep.minTokenVolume24h ?? 750_000}`);
+    }
+    if (tokenMcap < (ep.minMcap ?? 200_000)) {
+      failures.push(`token mcap $${Math.round(tokenMcap)} < $${ep.minMcap ?? 200_000}`);
+    }
+    if (!supertrendOk) {
+      failures.push(`5m Supertrend not green/above price (direction=${indicators?.supertrend_direction ?? "unknown"})`);
+    }
+
+    if (failures.length > 0) {
+      return {
+        success: false,
+        error: `Evil Panda entry blocked: ${failures.join("; ")}.`,
+        okx: {
+          token_volume_24h: tokenVolume24h,
+          token_mcap: tokenMcap,
+          supertrend: indicators?.supertrend || null,
+          rsi_2: indicators?.rsi_2 ?? null,
+        },
+      };
+    }
+    log("deploy", `Evil Panda entry approved: spot single-sided, range=${price_range_pct}%, volume24H=$${Math.round(tokenVolume24h)}, mcap=$${Math.round(tokenMcap)}, supertrend=${indicators.supertrend_direction}`);
   }
 
   // ─── Hard guard: two-sided spot requires ALL 4 conditions ──────
@@ -606,7 +670,8 @@ export async function deployPosition({
         pool_name,
         base_mint: pool.lbPair.tokenXMint.toBase58(),
         strategy: activeStrategy,
-        strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct === 100 ? "SpotOneSide" : "SpotTwoSide"),
+        strategy_profile: config.strategy.activeStrategy || null,
+        strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct == null || sol_split_pct >= 100 ? "SpotOneSide" : "SpotTwoSide"),
         sol_split_pct: sol_split_pct ?? (activeStrategy === "bid_ask" ? 100 : null),
         bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
         bin_step: resolvedBinStep,
@@ -673,7 +738,8 @@ export async function deployPosition({
       pool_name,
       base_mint: pool.lbPair.tokenXMint.toBase58(),
       strategy: activeStrategy,
-      strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct === 100 ? "SpotOneSide" : "SpotTwoSide"),
+      strategy_profile: config.strategy.activeStrategy || null,
+      strategy_type: activeStrategy === "bid_ask" ? "BidAsk" : (sol_split_pct == null || sol_split_pct >= 100 ? "SpotOneSide" : "SpotTwoSide"),
       sol_split_pct: sol_split_pct ?? (activeStrategy === "bid_ask" ? 100 : null),
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step: resolvedBinStep,
@@ -1184,8 +1250,9 @@ export async function getMyPositions({ force = false } = {}) {
         position: r.position,
         pool: r.pool,
         pair: r.pair,
-        base_mint: r.base_mint,
+        base_mint: trackedFinal?.base_mint || r.base_mint,
         strategy: trackedFinal?.strategy || p?._lpa_strategy || "bid_ask",
+        strategy_profile: trackedFinal?.strategy_profile || null,
         strategy_type: p?._lpa_strategy || trackedFinal?.strategy_type || null,
         sol_split_pct: trackedFinal?.sol_split_pct ?? composition?.sol_pct ?? null,
         bin_step: trackedFinal?.bin_step || null,

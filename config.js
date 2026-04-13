@@ -73,8 +73,14 @@ export const config = {
 
   // ─── Strategy Mapping ───────────────────
   strategy: {
-    strategy:   u.strategy   ?? "bid_ask",
+    activeStrategy: u.activeStrategy ?? "evil_panda",
+    strategy:   u.strategy   ?? "spot",
     binsBelow:  u.binsBelow  ?? 69,  // activeBin - 69 to activeBin = 70 bins total (program max)
+    evilPanda: {
+      minTokenVolume24h: u.evilPandaMinTokenVolume24h ?? 750_000,
+      minMcap: u.evilPandaMinMcap ?? 200_000,
+      priceRangePct: u.evilPandaPriceRangePct ?? 80,
+    },
   },
 
   // ─── Scheduling ─────────────────────────

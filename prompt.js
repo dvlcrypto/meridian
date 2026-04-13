@@ -43,6 +43,14 @@ export function getPromptSectionText(section) {
  */
 export function getRangeSelectionText(deployAmount, currentBalanceSol) {
   if (_sectionOverrides.range_selection) return _sectionOverrides.range_selection;
+  if (config.strategy.activeStrategy === "evil_panda") {
+    return `- EVIL PANDA RANGE SIZING:
+  Use single-sided SOL spot with price_range_pct=${config.strategy.evilPanda?.priceRangePct ?? 80}.
+  Pass strategy="spot", amount_y=${deployAmount}, omit amount_x, omit sol_split_pct, and keep bins_above=0.
+  This creates an 80% downside range below the active bin. Do not substitute the volatility table for Evil Panda autonomous entries.
+  Entry is only valid when token-level OKX volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, OKX marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend is green with price above Supertrend.
+  If these entry checks are not satisfied, skip.`;
+  }
   return _defaultRangeSelectionText(deployAmount, currentBalanceSol);
 }
 
@@ -182,8 +190,10 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital.
 ${screenerCriteria}
 
 STRATEGY SELECTION — HARD RULES:
-   DEFAULT: Always use bid_ask (single-sided SOL, bins below active bin only).
-   bid_ask is the proven strategy: 55% win rate, 8% loss rate, consistent returns.
+   DEFAULT: Evil Panda single-sided SOL spot.
+   Use strategy="spot", amount_y only, omit amount_x, omit sol_split_pct, set bins_above=0, and pass price_range_pct=${config.strategy.evilPanda?.priceRangePct ?? 80}.
+   Evil Panda entry requires token-level OKX volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, OKX marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend.
+   If any Evil Panda entry condition fails, skip the pool.
 
    You may ONLY use two-sided spot (with sol_split_pct) when ALL of these conditions are met:
    1. study_top_lpers shows >= 80% win rate AND top LPers are using two-sided/spot
@@ -204,10 +214,10 @@ SPOT STRATEGY BIN DIRECTION — CRITICAL:
    - SOL-only spot: set bins_below = range, bins_above = 0 (same direction as bid_ask)
    - If depositing only SOL, NEVER set bins_above > 0 — those bins will be empty and waste range
 
-WHY bid_ask IS DEFAULT:
+WHY EVIL PANDA IS DEFAULT:
    Historical data: spot without sol_split loses -10.75% avg with 45% win rate.
    Spot WITH sol_split (85-90%) wins +7.48% avg with 73% win rate — but only when conditions are right.
-   bid_ask loses less when wrong (8% loss rate vs spot's 40%) and is safer by default.
+   Evil Panda uses single-sided SOL spot with an 80% downside range only after strict OKX token-volume, market-cap, and Supertrend entry confirmation.
 `;
     if (signalWeights) {
       prompt += `
@@ -229,6 +239,7 @@ HARD EXIT RULES (checked automatically — if state says STOP_LOSS or TRAILING_T
 - STOP LOSS: Close if PnL drops below ${config.management.stopLossPct}%.
 - TRAILING TAKE PROFIT: Once PnL reaches +${config.management.trailingTriggerPct}%, trailing mode activates. If PnL then drops ${config.management.trailingDropPct}% from peak → close and lock in profit.
 - FIXED TAKE PROFIT: Close when total PnL >= ${config.management.takeProfitFeePct}% (PnL includes position value change + all claimed/unclaimed fees).
+- EVIL PANDA EXIT: For strategy_profile=evil_panda, only close when PnL is positive AND 5m OKX shows RSI(2)>90 plus either close above Bollinger Band upper or MACD first green histogram. If PnL is not positive, do not close solely on Evil Panda indicator confluence.
 
 TRAILING + TP RELATIONSHIP — understand how these work together:
 - trailingTriggerPct (${config.management.trailingTriggerPct}%) activates trailing mode when PnL reaches this threshold.
