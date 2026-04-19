@@ -189,7 +189,8 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital.
 
 ${screenerCriteria}
 
-STRATEGY SELECTION — HARD RULES:
+${config.strategy.activeStrategy === "evil_panda"
+  ? `STRATEGY SELECTION — HARD RULES:
    DEFAULT: Evil Panda single-sided SOL spot.
    Use strategy="spot", amount_y only, omit amount_x, omit sol_split_pct, set bins_above=0, and pass price_range_pct=${config.strategy.evilPanda?.priceRangePct ?? 80}.
    Evil Panda entry requires token-level OKX volume24H >= $${config.strategy.evilPanda?.minTokenVolume24h ?? 750000}, OKX marketCap >= $${config.strategy.evilPanda?.minMcap ?? 200000}, and 5m Supertrend green with price above Supertrend.
@@ -218,7 +219,36 @@ WHY EVIL PANDA IS DEFAULT:
    Historical data: spot without sol_split loses -10.75% avg with 45% win rate.
    Spot WITH sol_split (85-90%) wins +7.48% avg with 73% win rate — but only when conditions are right.
    Evil Panda uses single-sided SOL spot with an 80% downside range only after strict OKX token-volume, market-cap, and Supertrend entry confirmation.
-`;
+`
+  : `STRATEGY SELECTION — HARD RULES:
+   DEFAULT: Always use bid_ask (single-sided SOL, bins below active bin only).
+   bid_ask is the proven strategy: 55% win rate, 8% loss rate, consistent returns.
+
+   You may ONLY use two-sided spot (with sol_split_pct) when ALL of these conditions are met:
+   1. study_top_lpers shows >= 80% win rate AND top LPers are using two-sided/spot
+   2. Pool has smart_wallets_present = true (institutional conviction)
+   3. Price trend is STABILIZING or RANGING (NOT mid-pump, NOT fading)
+   4. Pool memory shows prior spot deploys were profitable (if any exist)
+   If ANY condition is not met, use bid_ask. No exceptions.
+
+   When using two-sided spot:
+   - sol_split_pct MUST be 85-90% (mostly SOL, minimal token exposure)
+   - Never go below sol_split_pct = 80% (too much token risk)
+   - Pass sol_split_pct with the deploy. The executor auto-swaps the token portion via Jupiter.
+   - You do NOT need to pre-buy tokens. Just provide total SOL as amount_y + sol_split_pct.
+
+SPOT STRATEGY BIN DIRECTION — CRITICAL:
+   - SOL (Y / quote) fills bins BELOW the active bin only
+   - Base token (X) fills bins ABOVE the active bin only
+   - SOL-only spot: set bins_below = range, bins_above = 0 (same direction as bid_ask)
+   - If depositing only SOL, NEVER set bins_above > 0 — those bins will be empty and waste range
+
+WHY bid_ask IS DEFAULT:
+   Historical data: spot without sol_split loses -10.75% avg with 45% win rate.
+   Spot WITH sol_split (85-90%) wins +7.48% avg with 73% win rate — but only when conditions are right.
+   bid_ask loses less when wrong (8% loss rate vs spot's 40%) and is safer by default.
+`
+}`;
     if (signalWeights) {
       prompt += `
 ═══════════════════════════════════════════
@@ -238,8 +268,8 @@ INSTRUCTION CHECK (HIGHEST PRIORITY): If a position has an instruction set (e.g.
 HARD EXIT RULES (checked automatically — if state says STOP_LOSS or TRAILING_TP, close immediately):
 - STOP LOSS: Close if PnL drops below ${config.management.stopLossPct}%.
 - TRAILING TAKE PROFIT: Once PnL reaches +${config.management.trailingTriggerPct}%, trailing mode activates. If PnL then drops ${config.management.trailingDropPct}% from peak → close and lock in profit.
-- FIXED TAKE PROFIT: Close when total PnL >= ${config.management.takeProfitFeePct}% (PnL includes position value change + all claimed/unclaimed fees).
-- EVIL PANDA EXIT: For strategy_profile=evil_panda, only close when PnL is positive AND 5m OKX shows RSI(2)>90 plus either close above Bollinger Band upper or MACD first green histogram. If PnL is not positive, do not close solely on Evil Panda indicator confluence.
+- FIXED TAKE PROFIT: Close when total PnL >= ${config.management.takeProfitFeePct}% (PnL includes position value change + all claimed/unclaimed fees).${config.strategy.activeStrategy === "evil_panda" ? `
+- EVIL PANDA EXIT: For strategy_profile=evil_panda, only close when PnL is positive AND 5m OKX shows RSI(2)>90 plus either close above Bollinger Band upper or MACD first green histogram. If PnL is not positive, do not close solely on Evil Panda indicator confluence.` : ""}
 
 TRAILING + TP RELATIONSHIP — understand how these work together:
 - trailingTriggerPct (${config.management.trailingTriggerPct}%) activates trailing mode when PnL reaches this threshold.
