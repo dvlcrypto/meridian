@@ -1576,32 +1576,93 @@ export async function closePosition({ position_address, _pnlOverride = null }) {
       } catch { /* best-effort */ }
 
       // ─── Hard rule: always swap base token back to SOL after close ───
-      try {
-        const baseMint = tracked.base_mint;
-        const SOL = "So11111111111111111111111111111111111111112";
-        if (baseMint && baseMint !== SOL) {
-          const walletBals = await getWalletBalances();
-          const baseToken = walletBals.tokens?.find((t) => t.mint === baseMint);
-          if (baseToken && baseToken.balance > 0 && (baseToken.usd ?? 0) >= 0.10) {
-            log("close", `Auto-swapping ${baseToken.balance} ${baseToken.symbol || baseMint.slice(0, 8)} -> SOL (worth $${baseToken.usd})`);
-            const swapResult = await swapToken({
+      // Retries up to MAX_ATTEMPTS with backoff; re-fetches wallet balance
+      // between attempts so a silently-landed first tx doesn't cause a
+      // false insufficient-funds failure on retry.
+      const SOL = "So11111111111111111111111111111111111111112";
+      const baseMint = tracked.base_mint;
+      let swapOutcome = null; // { success, mint, attempts, error? } when a swap was attempted
+
+      if (baseMint && baseMint !== SOL) {
+        const MAX_ATTEMPTS = 3;
+        const BACKOFF_MS = [0, 1500, 3000]; // delay BEFORE attempt N
+        let lastError = null;
+        let attempts = 0;
+        let succeeded = false;
+
+        for (let i = 0; i < MAX_ATTEMPTS; i++) {
+          if (BACKOFF_MS[i]) await new Promise((r) => setTimeout(r, BACKOFF_MS[i]));
+
+          let baseToken;
+          try {
+            const walletBals = await getWalletBalances();
+            baseToken = walletBals.tokens?.find((t) => t.mint === baseMint);
+          } catch (balErr) {
+            lastError = `balance fetch failed: ${balErr.message}`;
+            log("close_warn", `Post-close swap attempt ${i + 1}: ${lastError}`);
+            attempts = i + 1;
+            continue;
+          }
+
+          // Nothing to swap — either fully swapped by a prior attempt, or dust
+          if (!baseToken || baseToken.balance <= 0 || (baseToken.usd ?? 0) < 0.10) {
+            if (attempts > 0) succeeded = true; // prior attempt effectively cleared it
+            break;
+          }
+
+          attempts = i + 1;
+          log("close", `Auto-swapping ${baseToken.balance} ${baseToken.symbol || baseMint.slice(0, 8)} -> SOL (worth $${baseToken.usd}) [attempt ${attempts}/${MAX_ATTEMPTS}]`);
+
+          let swapResult;
+          try {
+            swapResult = await swapToken({
               input_mint: baseMint,
               output_mint: SOL,
               amount: baseToken.balance,
             });
-            if (swapResult?.success) {
-              log("close", `Post-close swap OK: tx ${swapResult.tx}`);
-              txHashes.push(swapResult.tx);
-            } else {
-              log("close_warn", `Post-close swap failed: ${swapResult?.error || "unknown"}`);
-            }
+          } catch (swapErr) {
+            lastError = swapErr.message;
+            log("close_warn", `Post-close swap attempt ${attempts} threw: ${lastError}`);
+            continue;
+          }
+
+          if (swapResult?.success) {
+            log("close", `Post-close swap OK on attempt ${attempts}: tx ${swapResult.tx}`);
+            txHashes.push(swapResult.tx);
+            succeeded = true;
+            break;
+          }
+
+          lastError = swapResult?.error || "unknown";
+          log("close_warn", `Post-close swap attempt ${attempts} failed: ${lastError}`);
+
+          // Terminal errors — no point retrying
+          const terminal = /no route|route not found|unsupported|invalid mint|mint not found/i.test(lastError);
+          if (terminal) {
+            log("close_warn", `Post-close swap terminal error, not retrying: ${lastError}`);
+            break;
           }
         }
-      } catch (swapErr) {
-        log("close_warn", `Post-close swap error: ${swapErr.message}`);
+
+        if (attempts > 0) {
+          swapOutcome = succeeded
+            ? { success: true, mint: baseMint, attempts }
+            : { success: false, mint: baseMint, attempts, error: lastError };
+          if (!succeeded) {
+            log("close_warn", `Post-close swap failed after ${attempts} attempt(s); base token remains in wallet: ${baseMint}`);
+          }
+        }
       }
 
-      return { success: true, position: position_address, pool: poolAddress, txs: txHashes, pnl_usd: pnlUsd, pnl_pct: pnlPct };
+      return {
+        success: true,
+        position: position_address,
+        pool: poolAddress,
+        txs: txHashes,
+        pnl_usd: pnlUsd,
+        pnl_pct: pnlPct,
+        ...(swapOutcome && { swap: swapOutcome }),
+      };
     }
 
     return { success: true, position: position_address, pool: poolAddress, txs: txHashes };
